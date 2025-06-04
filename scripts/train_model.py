@@ -1,93 +1,105 @@
 import pandas as pd
 import numpy as np
-from lightautoml.automl.presets.tabular_presets import TabularAutoML
-from lightautoml.tasks import Task
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score
+import torch
 import pickle
 import os
-from utils import load_data
+from imblearn.over_sampling import SMOTE
+from lightautoml.automl.presets.tabular_presets import TabularAutoML
+from lightautoml.tasks import Task
+from sklearn.metrics import precision_score, recall_score
 from preprocess import preprocess_data
-from scipy.special import expit  # Сигмоидная функция
-
-# Загрузка данных
-data_path = "data/raw/student_data.csv"
-df = load_data(data_path)
-
-# Препроцессинг
-df = preprocess_data(df)
-
-# Определение признаков и целевой переменной
-features = [
-    "online_activity",
-    "assignments_completed",
-    "grades",
-    "forum_participation",
-    "activity_trend",
-    "assignments_trend",
-    "grades_trend",
-    "activity_score",
-    "activity_ratio",
-    "log_activity_score",
-    "activity_forum_interaction",
-    "cumulative_grades",
-    "low_activity_flag",
-    "age",
-    "semester",
-    "region",
-]
-target = "churn"
-
-# Разделение на train/test по student_id
-student_ids = df["student_id"].unique()
-train_ids, test_ids = train_test_split(student_ids, test_size=0.2, random_state=42)
-train_data = df[df["student_id"].isin(train_ids)]
-test_data = df[df["student_id"].isin(test_ids)]
-
-# Настройка задачи
-task = Task("binary", metric="auc")
-
-# Настройка LightAutoML
-automl = TabularAutoML(
-    task=task,
-    timeout=1800,  # 30 минут
-    cpu_limit=4,
-    general_params={"use_algos": [["catboost", "lgb", "xgboost"]], "nn_models": None},
-    reader_params={
-        "cv": 5,
-        "random_state": 42,
-        "class_weights": {0: 1, 1: 5},
-    },  # Балансировка классов
-    tuning_params={"max_tuning_iter": 10},
-)
-
-# Обучение модели
-train_data_subset = train_data[features + [target]]
-oof_pred = automl.fit_predict(
-    train_data_subset, roles={"target": target, "category": ["region"]}, verbose=1
-)
 
 
-# Калибровка вероятностей (сигмоидная функция)
-def calibrate_probs(raw_probs):
-    return expit(raw_probs)
+def train_model():
+    # Constants
+    RANDOM_STATE = 42
+    N_THREADS = 4
+    N_FOLDS = 5
+    TARGET_NAME = "churn"
+    TIMEOUT = 300
+    MODEL_PATH = "models/automl_model.pkl"
+
+    # Create models directory if it doesn't exist
+    os.makedirs("models", exist_ok=True)
+
+    # ... (rest of your existing code remains the same until the metrics printing)
+
+    print("\nModel Performance Metrics:")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+
+    # Save the model
+    print(f"\nSaving model to {MODEL_PATH}...")
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(automl, f)
+    print("Model saved successfully!")
 
 
-# Оценка на тестовой выборке
-y_true = test_data[target]
-raw_probs = automl.predict(test_data[features]).data
-y_prob = calibrate_probs(raw_probs)
+def train_model():
+    # Constants
+    RANDOM_STATE = 42
+    N_THREADS = 4
+    N_FOLDS = 5
+    TARGET_NAME = "churn"
+    TIMEOUT = 300
+    MODEL_PATH = "models/automl_model.pkl"
 
-# Проверка метрик для разных порогов
-thresholds = [0.1, 0.2, 0.3, 0.4]
-for thresh in thresholds:
-    y_pred = (y_prob > thresh).astype(int)
-    precision = precision_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred)
-    print(f"Threshold {thresh}: Precision = {precision:.2f}, Recall = {recall:.2f}")
+    # Create models directory if it doesn't exist
+    os.makedirs("models", exist_ok=True)
 
-# Сохранение модели
-os.makedirs("models", exist_ok=True)
-with open("models/churn_model.pkl", "wb") as f:
-    pickle.dump(automl, f)
-print("Модель сохранена в models/churn_model.pkl")
+    # Set random seeds
+    np.random.seed(RANDOM_STATE)
+    torch.set_num_threads(N_THREADS)
+
+    # Load and preprocess data
+    print("Loading and preprocessing data...")
+    df = pd.read_csv("data/raw/student_data.csv")
+    train_df, test_df, ohe = preprocess_data(df)
+
+    # Apply SMOTE
+    print("Applying SMOTE for class balancing...")
+    smote = SMOTE(random_state=RANDOM_STATE)
+    X_train, y_train = train_df.drop(columns=["churn"]), train_df["churn"]
+    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+    train_data = pd.concat([X_train_resampled, y_train_resampled], axis=1)
+
+    # Setup LightAutoML
+    print("Setting up and training LightAutoML model...")
+    task = Task("binary", metric="auc")
+    roles = {"target": TARGET_NAME, "drop": ["student_id"]}
+
+    automl = TabularAutoML(
+        task=task,
+        timeout=TIMEOUT,
+        cpu_limit=N_THREADS,
+        reader_params={
+            "n_jobs": N_THREADS,
+            "cv": N_FOLDS,
+            "random_state": RANDOM_STATE,
+        },
+    )
+
+    # Train model
+    out_of_fold_predictions = automl.fit_predict(train_data, roles=roles, verbose=1)
+    test_predictions = automl.predict(test_df)
+
+    # Calculate and print metrics
+    y_test = test_df[TARGET_NAME]
+    y_pred = (test_predictions.data[:, 0] > 0.5).astype(int)
+
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+
+    print("\nModel Performance Metrics:")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+
+    # Save the model
+    print(f"\nSaving model to {MODEL_PATH}...")
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(automl, f)
+    print("Model saved successfully!")
+
+
+if __name__ == "__main__":
+    train_model()

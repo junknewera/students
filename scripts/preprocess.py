@@ -1,66 +1,100 @@
+# src/data/preprocess.py
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from pathlib import Path
-import os
-from dotenv import load_dotenv
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import train_test_split
 
-# Загрузка конфигурации
-load_dotenv()
-DATA_PATH = os.getenv("DATA_PATH", "data/raw/synthetic_students.csv")
-PROCESSED_PATH = os.getenv("PROCESSED_PATH", "data/processed/processed_students.csv")
 
-# Чтение данных
-df = pd.read_csv(DATA_PATH)
+def preprocess_data(df: pd.DataFrame, test_size: float = 0.2) -> tuple:
+    """Основная функция предобработки данных"""
+    df = df.copy()
 
-# Заполнение пропусков
-# Attendance: медиана по факультету
-df["attendance"] = df.groupby("faculty")["attendance"].transform(
-    lambda x: x.fillna(x.median())
-)
-# Avg_grade: среднее по студенту
-df["avg_grade"] = df.groupby("student_id")["avg_grade"].transform(
-    lambda x: x.fillna(x.mean())
-)
-# Если пропуски остались (нет данных по студенту), заполняем глобальной медианой
-df["attendance"].fillna(df["attendance"].median(), inplace=True)
-df["avg_grade"].fillna(df["avg_grade"].mean(), inplace=True)
+    # 1. Сортировка по student_id и semester
+    df = df.sort_values(["student_id", "semester"])
 
-# Проверка и пересчёт признаков (для демонстрации)
-df["lms_activity_score"] = (
-    df["lms_logins"] / df["lms_logins"].max()
-    + df["lms_tasks_done"] / df["lms_tasks_done"].max()
-) / 2
-df["grade_trend"] = df.groupby("student_id")["avg_grade"].diff().fillna(0)
-df["attendance_drop"] = -df.groupby("student_id")["attendance"].diff().fillna(0)
+    # 2. Фича-инжиниринг
+    df = _generate_features(df)
 
-# Кодирование категориальных признаков
-categorical_cols = ["region", "faculty", "campus"]
-encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-encoded_cats = pd.DataFrame(
-    encoder.fit_transform(df[categorical_cols]),
-    columns=encoder.get_feature_names_out(categorical_cols),
-)
-df = df.drop(categorical_cols, axis=1).join(encoded_cats)
+    # 3. Обработка пропусков
+    df = _handle_missing_values(df)
 
-# Нормализация числовых признаков
-numeric_cols = [
-    "age",
-    "attendance",
-    "avg_grade",
-    "lms_logins",
-    "lms_tasks_done",
-    "tuition_fee",
-    "initial_discount",
-    "lms_activity_score",
-    "grade_trend",
-    "attendance_drop",
-]
-scaler = StandardScaler()
-df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+    # 4. Кодирование категориальных признаков
+    df, ohe = _encode_categorical(df)
 
-# Сохранение обработанных данных
-Path("data/processed").mkdir(parents=True, exist_ok=True)
-df.to_csv(PROCESSED_PATH, index=False)
+    # 5. Разделение на train/test по student_id
+    train_df, test_df = _train_test_split(df, test_size)
 
-print(f"Обработанные данные сохранены в {PROCESSED_PATH}")
+    return train_df, test_df, ohe
+
+
+def _generate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Генерация новых признаков"""
+    # Тренды активности
+    df["activity_trend"] = df.groupby("student_id")["online_activity"].diff().fillna(0)
+    df["assignments_trend"] = (
+        df.groupby("student_id")["assignments_completed"].diff().fillna(0)
+    )
+
+    # Комбинированные метрики
+    df["activity_score"] = (
+        0.4 * df["online_activity"]
+        + 0.4 * df["assignments_completed"]
+        + 0.2 * df["forum_participation"]
+    )
+
+    # Кумулятивные показатели
+    df["cumulative_grades"] = df.groupby("student_id")["grades"].transform(
+        lambda x: x.expanding().mean()
+    )
+
+    # Флаги аномалий
+    df["low_activity_flag"] = (
+        (df["online_activity"] < 30) | (df["assignments_completed"] < 40)
+    ).astype(int)
+
+    return df
+
+
+def _handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Заполнение пропусков"""
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    for col in numeric_cols:
+        df[col] = df.groupby("semester")[col].transform(lambda x: x.fillna(x.median()))
+    return df
+
+
+def _encode_categorical(df: pd.DataFrame) -> tuple:
+    """One-Hot Encoding для региона и факультета"""
+    ohe = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+    cat_cols = ["region", "faculty"]
+    ohe_features = ohe.fit_transform(df[cat_cols])
+
+    # Создаем DF с новыми признаками
+    ohe_df = pd.DataFrame(
+        ohe_features, columns=ohe.get_feature_names_out(cat_cols), index=df.index
+    )
+
+    # Удаляем исходные колонки и объединяем с OHE
+    df = df.drop(columns=cat_cols)
+    df = pd.concat([df, ohe_df], axis=1)
+
+    return df, ohe
+
+
+def _train_test_split(df: pd.DataFrame, test_size: float) -> tuple:
+    """Разделение по student_id (без утечки данных)"""
+    student_ids = df["student_id"].unique()
+    train_ids, test_ids = train_test_split(
+        student_ids, test_size=test_size, random_state=42
+    )
+
+    train_df = df[df["student_id"].isin(train_ids)]
+    test_df = df[df["student_id"].isin(test_ids)]
+
+    return train_df, test_df
+
+
+if __name__ == "__main__":
+    df = pd.read_csv("data/raw/student_data.csv")
+    train_df, test_df, ohe = preprocess_data(df)
+    print(train_df.shape, test_df.shape)
