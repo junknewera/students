@@ -43,7 +43,13 @@ for student_id in range(1, n_students + 1):
             online_activity *= 0.8
             assignments_completed *= 0.8
             grades *= 0.9
-            churn = 1
+            # Увеличиваем вероятность оттока
+            churn_prob = (
+                0.85
+                if (online_activity < 60 or assignments_completed < 60 or grades < 3)
+                else 0.15
+            )
+            churn = np.random.choice([0, 1], p=[1 - churn_prob, churn_prob])
         else:
             churn = 0
 
